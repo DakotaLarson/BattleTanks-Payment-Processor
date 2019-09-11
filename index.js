@@ -11,7 +11,9 @@ const app = express();
 app.use(cors());
 app.use(bodyParser.json());
 
-const PORT = 4000;
+const PROD_PORT = 4000;
+const DEV_PORT = 4001;
+
 const CRED_FILE_NAME = "keys.json";
 
 const PAYPAL_DEV_ID = "Aewej6sIM4EIrsQev3vgeZ2N8Cv7mJrJeQP0bF2YGkOcCHGPxmdQd2yCQy27QEYBpN-yGPJ823iYoG3w";
@@ -21,6 +23,8 @@ let COINBASE_SECRET;
 
 const PAYPAL_SIG_HEADER = "paypal-transmission-sig";
 const COINBASE_SIG_HEADER = "x-cc-webhook-signature";
+
+const isDev = process.argv.includes("dev");
 
 const paypalQuantitiesByPrices = new Map([
     ["0.99", 250],
@@ -39,7 +43,6 @@ let pool;
 
 async function start() {
     const credentials = await retrieveCredentials();
-    const isDev = process.argv.includes("dev");
 
     PAYPAL_SECRET = isDev ? credentials.paypal.dev : credentials.paypal.prod;
     COINBASE_SECRET = isDev ? credentials.coinbase.dev : credentials.coinbase.prod;
@@ -58,12 +61,47 @@ async function start() {
         }
     });
 
-    createPool(credentials.database, isDev);
+    createPool(credentials.database);
 
-    app.listen(PORT, () => console.log("Payment processor listening..."));
+    let paypalCompleteUrl = "/payment/complete/paypal/";
+    let paypalCreateUrl = "/payment/create/paypal/";
+    let coinbaseUrl = "/payment/coinbase/";
+    if (isDev) {
+        paypalCompleteUrl = "/dev" + paypalCompleteUrl;
+        paypalCreateUrl = "/dev" + paypalCreateUrl;
+        coinbaseUrl = "/dev" + coinbaseUrl;
+    }
+
+    app.post(paypalCompleteUrl, processPaypalCompleteRequest);
+    app.post(paypalCreateUrl, processPaypalCreateRequest);
+    app.post(coinbaseUrl, processCoinbaseRequest);
+
+    const port = isDev ? DEV_PORT : PROD_PORT;
+    app.listen(port, () => console.log("Payment processor listening on port " + port));
 }
 
-app.post("/payment/complete/paypal/", async (req, res) => {
+async function processPaypalCreateRequest(req, res) {
+    if (req.body && req.body.paymentId && req.body.playerId) {
+        try {
+            const connection = await startTransaction();
+            try {
+                await createPaypalPayment(req.body.paymentId, req.body.playerId, connection);
+                await commit(connection);
+            } catch (err) {
+                await rollback(connection);
+                throw err;
+            }
+            res.sendStatus(200);
+        } catch (err) {
+            console.error(err);
+            res.sendStatus(500);
+        }
+    } else {
+        res.sendStatus(403);
+    }
+}
+
+async function processPaypalCompleteRequest(req, res) {
     const url = "https://" + req.headers.host + req.url;
     const webhookId = webhooksByUrls.get(url);
     if (req.body && PAYPAL_SIG_HEADER in req.headers) {
@@ -71,7 +109,7 @@ app.post("/payment/complete/paypal/", async (req, res) => {
             if (await verifyPaypal(req.headers, req.body, webhookId)) {
                 const connection = await startTransaction();
                 try {
-                    await processPaypalCompletePayment(req.body, connection);
+                    await completePaypalPayment(req.body, connection);
                     await commit(connection);
                 } catch (err) {
                     await rollback(connection);
@@ -88,34 +126,20 @@ app.post("/payment/complete/paypal/", async (req, res) => {
     } else {
         res.sendStatus(403);
     }
-});
-app.post("/payment/create/paypal/", async (req, res) => {
-    if (req.body && req.body.paymentId && req.body.playerId) {
-        try {
-            const connection = await startTransaction();
-            try {
-                await processPaypalCreatePayment(req.body.paymentId, req.body.playerId, connection);
-                await commit(connection);
-            } catch (err) {
-                await rollback(connection);
-                throw err;
-            }
-            res.sendStatus(200);
-        } catch (err) {
-            console.error(err);
-            res.sendStatus(500);
-        }
-    } else {
-        res.sendStatus(403);
-    }
-})
+}
 
-app.post("/payment/coinbase/", async (req, res) => {
+async function processCoinbaseRequest(req, res) {
 	if (req.body && COINBASE_SIG_HEADER in req.headers) {
         try {
             if (verifyCoinbase(JSON.stringify(req.body), req.headers[COINBASE_SIG_HEADER], COINBASE_SECRET)) {
-                
-                const playerId = req.body.event.data.metadata.custom;
+                const metadata = req.body.event.data.metadata.custom.split(":");
+                const isDevRequest = metadata[1] === "dev";
+                if (isDev !== isDevRequest) {
+                    res.sendStatus(200);
+                    console.log("Request is not for this environment.");
+                    return;
+                }
+                const playerId = metadata[0];
                 const payment = req.body.event.data.pricing.local.amount;
                 const paymentId = req.body.event.data.code;
 
@@ -138,7 +162,7 @@ app.post("/payment/coinbase/", async (req, res) => {
     } else {
         res.sendStatus(403);
     }
-});
+}
 
 function verifyCoinbase(payload, header, secret) {
     const code = crypto.createHmac("sha256", secret);
@@ -158,10 +182,9 @@ function verifyPaypal(headers, body, webhookId) {
             }
         });
     });
-    
 }
 
-async function processPaypalCreatePayment(paymentId, playerId, connection) {
+async function createPaypalPayment(paymentId, playerId, connection) {
     const playerValidationSql = "SELECT username FROM players WHERE id = ?";
     const playerValidationResults = await query(playerValidationSql, [playerId], connection);
     if (playerValidationResults.length === 1) {
@@ -173,7 +196,7 @@ async function processPaypalCreatePayment(paymentId, playerId, connection) {
     }
 }
 
-async function processPaypalCompletePayment(body, connection) {
+async function completePaypalPayment(body, connection) {
     const paymentId = body.resource.parent_payment;
     const total = body.resource.amount.total;
     const currency = paypalQuantitiesByPrices.get(total);
@@ -250,7 +273,7 @@ function retrieveCredentials() {
     });
 }
 
-function createPool(credentials, isDev) {
+function createPool(credentials) {
     let database = credentials.database;
     if (isDev) {
         database = credentials["database-dev"];
